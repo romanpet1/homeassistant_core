@@ -8,7 +8,8 @@
       }
     },
     "abort": {
-      "already_configured": "[%key:common::config_flow::abort::already_configured_service%]"
+      "already_configured": "[%key:common::config_flow::abort::already_configured_service%]",
+      "already_exist": "Shopping list already exists"
     }
   },
   "services": {

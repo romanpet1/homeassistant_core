@@ -18,6 +18,7 @@ from homeassistant.helpers.typing import ConfigType
 from homeassistant.util.json import JsonArrayType, load_json_array
 
 from .const import (
+    ATTR_LIST_NAME,
     ATTR_REVERSE,
     DEFAULT_REVERSE,
     DOMAIN,
@@ -36,19 +37,29 @@ ATTR_COMPLETE = "complete"
 
 _LOGGER = logging.getLogger(__name__)
 CONFIG_SCHEMA = vol.Schema({DOMAIN: {}}, extra=vol.ALLOW_EXTRA)
-ITEM_UPDATE_SCHEMA = vol.Schema({ATTR_COMPLETE: bool, ATTR_NAME: str})
+ITEM_UPDATE_SCHEMA = vol.Schema(
+    {ATTR_COMPLETE: bool, ATTR_NAME: str, ATTR_LIST_NAME: str}
+)
 PERSISTENCE = ".shopping_list.json"
 
-SERVICE_ITEM_SCHEMA = vol.Schema({vol.Required(ATTR_NAME): cv.string})
-SERVICE_LIST_SCHEMA = vol.Schema({})
+SERVICE_ITEM_SCHEMA = vol.Schema(
+    {vol.Optional(ATTR_LIST_NAME): cv.string, vol.Required(ATTR_NAME): cv.string}
+)
+SERVICE_LIST_SCHEMA = vol.Schema({vol.Optional(ATTR_LIST_NAME): cv.string})
 SERVICE_SORT_SCHEMA = vol.Schema(
-    {vol.Optional(ATTR_REVERSE, default=DEFAULT_REVERSE): bool}
+    {
+        vol.Optional(ATTR_LIST_NAME): cv.string,
+        vol.Optional(ATTR_REVERSE, default=DEFAULT_REVERSE): bool,
+    }
 )
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Initialize the shopping list."""
 
+    frontend.async_register_built_in_panel(
+        hass, "shopping-list", "shopping_list", "mdi:cart"
+    )
     if DOMAIN not in config:
         return True
 
@@ -66,12 +77,12 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
 
     async def add_item_service(call: ServiceCall) -> None:
         """Add an item with `name`."""
-        data = hass.data[DOMAIN]
+        data = hass.data[DOMAIN][call.data[ATTR_LIST_NAME]]
         await data.async_add(call.data[ATTR_NAME])
 
     async def remove_item_service(call: ServiceCall) -> None:
         """Remove the first item with matching `name`."""
-        data = hass.data[DOMAIN]
+        data = hass.data[DOMAIN][call.data[ATTR_LIST_NAME]]
         name = call.data[ATTR_NAME]
 
         try:
@@ -83,7 +94,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
 
     async def complete_item_service(call: ServiceCall) -> None:
         """Mark the first item with matching `name` as completed."""
-        data = hass.data[DOMAIN]
+        data = hass.data[DOMAIN][call.data[ATTR_LIST_NAME]]
         name = call.data[ATTR_NAME]
 
         try:
@@ -95,7 +106,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
 
     async def incomplete_item_service(call: ServiceCall) -> None:
         """Mark the first item with matching `name` as incomplete."""
-        data = hass.data[DOMAIN]
+        data = hass.data[DOMAIN][call.data[ATTR_LIST_NAME]]
         name = call.data[ATTR_NAME]
 
         try:
@@ -121,7 +132,8 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
         """Sort all items by name."""
         await data.async_sort(call.data[ATTR_REVERSE])
 
-    data = hass.data[DOMAIN] = ShoppingData(hass)
+    hass.data.setdefault(DOMAIN, {})
+    data = hass.data[DOMAIN][config_entry.title] = ShoppingData(hass)
     await data.async_load()
 
     hass.services.async_register(
@@ -169,10 +181,6 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     hass.http.register_view(UpdateShoppingListItemView)
     hass.http.register_view(ClearCompletedItemsView)
 
-    frontend.async_register_built_in_panel(
-        hass, "shopping-list", "shopping_list", "mdi:cart"
-    )
-
     websocket_api.async_register_command(hass, websocket_handle_items)
     websocket_api.async_register_command(hass, websocket_handle_add)
     websocket_api.async_register_command(hass, websocket_handle_remove)
@@ -181,6 +189,19 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     websocket_api.async_register_command(hass, websocket_handle_reorder)
 
     return True
+
+
+async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+
+    hass.data[DOMAIN].pop(config_entry.title)
+
+    return True
+
+
+async def async_update_entry(hass: HomeAssistant, config_entry: ConfigEntry):
+    """Reload component when options changed."""
+    await hass.config_entries.async_reload(config_entry.entry_id)
 
 
 class NoMatchingShoppingListItem(Exception):
@@ -370,25 +391,40 @@ class ClearCompletedItemsView(http.HomeAssistantView):
     async def post(self, request):
         """Retrieve if API is running."""
         hass = request.app["hass"]
-        await hass.data[DOMAIN].async_clear_completed()
+        cur_list = get_shopping_list(hass, "")
+        await cur_list.async_clear_completed()
         return self.json_message("Cleared completed items.")
 
 
+def get_shopping_list(hass: HomeAssistant, list_name: str | None) -> ShoppingData:
+    """Take shopping list by name or first if no such shopping list found."""
+    first_list_name = ""
+    for elem in hass.data[DOMAIN]:
+        first_list_name = elem
+        break
+    return hass.data[DOMAIN].get(list_name, hass.data[DOMAIN].get(first_list_name))
+
+
 @callback
-@websocket_api.websocket_command({vol.Required("type"): "shopping_list/items"})
+@websocket_api.websocket_command(
+    {vol.Required("type"): "shopping_list/items", vol.Optional("list_name"): str}
+)
 def websocket_handle_items(
     hass: HomeAssistant,
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
     """Handle getting shopping_list items."""
-    connection.send_message(
-        websocket_api.result_message(msg["id"], hass.data[DOMAIN].items)
-    )
+    cur_list = get_shopping_list(hass, msg.get("list_name", ""))
+    connection.send_message(websocket_api.result_message(msg["id"], cur_list.items))
 
 
 @websocket_api.websocket_command(
-    {vol.Required("type"): "shopping_list/items/add", vol.Required("name"): str}
+    {
+        vol.Required("type"): "shopping_list/items/add",
+        vol.Required("name"): str,
+        vol.Optional("list_id"): str,
+    }
 )
 @websocket_api.async_response
 async def websocket_handle_add(
@@ -397,12 +433,17 @@ async def websocket_handle_add(
     msg: dict[str, Any],
 ) -> None:
     """Handle adding item to shopping_list."""
-    item = await hass.data[DOMAIN].async_add(msg["name"], connection.context(msg))
+    cur_list = get_shopping_list(hass, msg.get("list_name", ""))
+    item = await cur_list.async_add(msg["name"], connection.context(msg))
     connection.send_message(websocket_api.result_message(msg["id"], item))
 
 
 @websocket_api.websocket_command(
-    {vol.Required("type"): "shopping_list/items/remove", vol.Required("item_id"): str}
+    {
+        vol.Required("type"): "shopping_list/items/remove",
+        vol.Required("item_id"): str,
+        vol.Optional(ATTR_LIST_NAME): str,
+    }
 )
 @websocket_api.async_response
 async def websocket_handle_remove(
@@ -416,7 +457,8 @@ async def websocket_handle_remove(
     msg.pop("type")
 
     try:
-        item = await hass.data[DOMAIN].async_remove(item_id, connection.context(msg))
+        cur_list = get_shopping_list(hass, msg.get("list_name", ""))
+        item = await cur_list.async_remove(item_id, connection.context(msg))
     except NoMatchingShoppingListItem:
         connection.send_message(
             websocket_api.error_message(msg_id, "item_not_found", "Item not found")
@@ -430,6 +472,7 @@ async def websocket_handle_remove(
     {
         vol.Required("type"): "shopping_list/items/update",
         vol.Required("item_id"): str,
+        vol.Optional("list_name"): str,
         vol.Optional("name"): str,
         vol.Optional("complete"): bool,
     }
@@ -447,9 +490,8 @@ async def websocket_handle_update(
     data = msg
 
     try:
-        item = await hass.data[DOMAIN].async_update(
-            item_id, data, connection.context(msg)
-        )
+        cur_list = get_shopping_list(hass, msg.get("list_name", ""))
+        item = await cur_list.async_update(item_id, data, connection.context(msg))
     except NoMatchingShoppingListItem:
         connection.send_message(
             websocket_api.error_message(msg_id, "item_not_found", "Item not found")
@@ -459,7 +501,12 @@ async def websocket_handle_update(
     connection.send_message(websocket_api.result_message(msg_id, item))
 
 
-@websocket_api.websocket_command({vol.Required("type"): "shopping_list/items/clear"})
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "shopping_list/items/clear",
+        vol.Optional(ATTR_LIST_NAME): str,
+    }
+)
 @websocket_api.async_response
 async def websocket_handle_clear(
     hass: HomeAssistant,
@@ -467,7 +514,8 @@ async def websocket_handle_clear(
     msg: dict[str, Any],
 ) -> None:
     """Handle clearing shopping_list items."""
-    await hass.data[DOMAIN].async_clear_completed(connection.context(msg))
+    cur_list = get_shopping_list(hass, msg.get(ATTR_LIST_NAME))
+    await cur_list.async_clear_completed(connection.context(msg))
     connection.send_message(websocket_api.result_message(msg["id"]))
 
 
@@ -485,7 +533,8 @@ def websocket_handle_reorder(
     """Handle reordering shopping_list items."""
     msg_id = msg.pop("id")
     try:
-        hass.data[DOMAIN].async_reorder(msg.pop("item_ids"), connection.context(msg))
+        cur_list = get_shopping_list(hass, msg.get("list_name", ""))
+        cur_list.async_reorder(msg.pop("item_ids"), connection.context(msg))
     except NoMatchingShoppingListItem:
         connection.send_error(
             msg_id,

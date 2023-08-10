@@ -2,6 +2,7 @@
 DOMAIN = "shopping_list"
 EVENT_SHOPPING_LIST_UPDATED = "shopping_list_updated"
 
+ATTR_LIST_NAME = "list-name"
 ATTR_REVERSE = "reverse"
 
 DEFAULT_REVERSE = False
